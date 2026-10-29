@@ -67,7 +67,7 @@ jobs:
     name: Verify required workflow results
     needs: identity
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 50
     permissions:
       actions: read # inspect required workflow results for the exact release commit
       contents: read

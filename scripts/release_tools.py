@@ -29,9 +29,11 @@ MAX_ASSET_TOTAL_SIZE = 8 * 1024 * 1024 * 1024
 MAX_COMMAND_OUTPUT = 4 * 1024 * 1024
 MAX_SBOM_SIZE = 128 * 1024 * 1024
 DEFAULT_COMMAND_TIMEOUT = 120.0
-DEFAULT_GATE_TIMEOUT = 20 * 60.0
+DEFAULT_GATE_TIMEOUT = 45 * 60.0
+MAX_GATE_TIMEOUT = 60 * 60.0
 DEFAULT_GATE_POLL_INTERVAL = 15.0
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+NIGHTLY_TAG_RE = re.compile(r"nightly-([0-9a-f]{40})")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHIPPED_NPM_DEV_PACKAGES = {"node_modules/vite": "vite"}
 MAX_TAG_PEEL_DEPTH = 8
@@ -371,7 +373,7 @@ def verify_required_workflows(
     for workflow in workflows:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
             raise ReleaseError(f"invalid workflow identity: {workflow!r}")
-    if timeout < 0 or timeout > 30 * 60 or poll_interval <= 0:
+    if timeout < 0 or timeout > MAX_GATE_TIMEOUT or poll_interval <= 0:
         raise ReleaseError("workflow gate timing is outside the allowed range")
 
     metadata = gh_api(repository, f"repos/{repository}")
@@ -1265,6 +1267,46 @@ def download_and_compare(
                 raise ReleaseError(f"remote asset differs: {asset.name}")
 
 
+def newest_published_nightly(repository: str) -> str | None:
+    """Return the commit of the nightly that install.sh --nightly selects."""
+
+    endpoint = f"repos/{repository}/releases"
+    releases = parse_json_value(
+        run_command(["gh", "api", "--method", "GET", endpoint, "-f", "per_page=100"]),
+        f"GitHub API {endpoint}",
+    )
+    if not isinstance(releases, list) or not all(
+        isinstance(release, dict) for release in releases
+    ):
+        raise ReleaseError("GitHub API returned a malformed release list")
+    for release in releases:
+        tag = release.get("tag_name")
+        match = NIGHTLY_TAG_RE.fullmatch(tag) if isinstance(tag, str) else None
+        if (
+            match
+            and release.get("draft") is False
+            and release.get("prerelease") is True
+        ):
+            return match.group(1)
+    return None
+
+
+def superseding_nightly(repository: str, sha: str) -> str | None:
+    newest = newest_published_nightly(repository)
+    if newest is None or newest == sha:
+        return None
+    endpoint = f"repos/{repository}/compare/{sha}...{newest}"
+    # The full comparison lists files and patches; only the ancestry is needed.
+    status = (
+        run_command(["gh", "api", "--method", "GET", endpoint, "--jq", ".status"])
+        .decode()
+        .strip()
+    )
+    if status not in {"ahead", "behind", "diverged", "identical"}:
+        raise ReleaseError(f"GitHub API returned an invalid comparison: {status!r}")
+    return newest if status == "ahead" else None
+
+
 def stable_notes(tag: str, sha: str) -> str:
     return f"AXIS {tag}\n\nRelease commit: `{sha}`.\n"
 
@@ -1296,6 +1338,13 @@ def publish_release(
         raise ReleaseError(f"unknown release type: {release_type}")
 
     assets = local_assets(asset_dir)
+    if release_type == "nightly":
+        # Re-running failed jobs of an old run does not repeat verify-default-source,
+        # and install.sh --nightly installs the most recently created nightly.
+        newer = superseding_nightly(repository, sha)
+        if newer is not None:
+            print(f"::notice::skipping {tag}: nightly-{newer} is newer and published")
+            return
     expected_prerelease = release_type == "nightly"
     remote_sha = remote_tag_commit(
         repository,

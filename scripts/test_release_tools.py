@@ -93,7 +93,12 @@ if arguments[:3] == ["api", "--method", "GET"]:
         print(json.dumps(state))
     elif endpoint.endswith("/releases"):
         releases = [read_state()] if (root / "release.json").exists() else []
+        other_path = root / "other-releases.json"
+        if other_path.exists():
+            releases = json.loads(other_path.read_text(encoding="utf-8")) + releases
         print(json.dumps(releases))
+    elif "/compare/" in endpoint:
+        print(os.environ["FAKE_GH_COMPARE_STATUS"])
     elif "/releases/assets/" in endpoint:
         asset_id = int(endpoint.rsplit("/", 1)[1])
         paths = sorted((root / "assets").iterdir())
@@ -259,6 +264,16 @@ class WorkflowGateTests(FakeGhTestCase):
         self.workflow_response("ci.yml", self.success())
         self.workflow_response("security.yml", self.success())
         self.run_gate()
+
+    def test_rejects_gate_timeout_above_the_maximum(self):
+        with self.assertRaisesRegex(release_tools.ReleaseError, "timing is outside"):
+            release_tools.verify_required_workflows(
+                "ROCm/axis",
+                self.sha,
+                ["ci.yml", "security.yml"],
+                release_tools.MAX_GATE_TIMEOUT + 1,
+                0.01,
+            )
 
     def test_rejects_missing_skipped_and_failed_required_jobs(self):
         cases = (
@@ -626,6 +641,86 @@ class PublicationTests(FakeGhTestCase):
         (self.assets / "extra.bin").write_bytes(b"extra")
         with self.assertRaisesRegex(release_tools.ReleaseError, "names differ"):
             self.publish()
+
+    def publish_after_nightly(self, other_sha: str, status: str) -> str:
+        (self.gh_root / "other-releases.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "tag_name": f"nightly-{other_sha}",
+                        "draft": False,
+                        "prerelease": True,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"FAKE_GH_COMPARE_STATUS": status}):
+            with redirect_stdout(output):
+                release_tools.publish_release(
+                    Path.cwd(),
+                    "nightly",
+                    f"nightly-{self.sha}",
+                    self.assets,
+                    f"Nightly {self.sha}",
+                    self.notes,
+                )
+        return output.getvalue()
+
+    def test_skips_nightly_superseded_by_a_newer_published_nightly(self):
+        newer = "4" * 40
+        output = self.publish_after_nightly(newer, "ahead")
+        self.assertIn(f"::notice::skipping nightly-{self.sha}", output)
+        self.assertFalse((self.gh_root / "tag.json").exists())
+        self.assertFalse((self.gh_root / "release.json").exists())
+        log = [
+            json.loads(line) for line in (self.gh_root / "log").read_text().splitlines()
+        ]
+        self.assertIn(
+            f"repos/ROCm/axis/compare/{self.sha}...{newer}", [entry[3] for entry in log]
+        )
+        self.assertFalse(
+            any(entry[0] == "release" or "POST" in entry for entry in log),
+            "a superseded nightly must not create a tag or release",
+        )
+
+    def test_publishes_nightly_newer_than_the_latest_published_nightly(self):
+        for status in ("behind", "diverged"):
+            with self.subTest(status=status):
+                for path in (self.gh_root / "release.json", self.gh_root / "tag.json"):
+                    path.unlink(missing_ok=True)
+                self.publish_after_nightly("4" * 40, status)
+                state = json.loads((self.gh_root / "release.json").read_text())
+                self.assertFalse(state["draft"])
+
+    def test_rejects_invalid_nightly_comparison(self):
+        with self.assertRaisesRegex(release_tools.ReleaseError, "invalid comparison"):
+            self.publish_after_nightly("4" * 40, "unknown")
+        self.assertFalse((self.gh_root / "tag.json").exists())
+
+    def test_ignores_drafts_and_stable_releases_when_finding_the_newest_nightly(self):
+        (self.gh_root / "other-releases.json").write_text(
+            json.dumps(
+                [
+                    {"tag_name": "v1.2.3", "draft": False, "prerelease": False},
+                    {
+                        "tag_name": f"nightly-{'4' * 40}",
+                        "draft": True,
+                        "prerelease": True,
+                    },
+                    {
+                        "tag_name": f"nightly-{'5' * 40}",
+                        "draft": False,
+                        "prerelease": True,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            release_tools.newest_published_nightly("ROCm/axis"), "5" * 40
+        )
 
     def test_creates_nightly_tag_at_release_commit_before_draft(self):
         self.publish()
@@ -1116,6 +1211,38 @@ class WorkflowStaticTests(unittest.TestCase):
             release_tools.SKIPPED_WORKFLOW_JOB_NAMES["security.yml"],
             {security["jobs"]["dependency-review"]["name"]},
         )
+
+    def test_gate_jobs_outlast_the_default_gate_timeout(self):
+        root = Path(__file__).resolve().parent.parent / ".github/workflows"
+        self.assertLessEqual(
+            release_tools.DEFAULT_GATE_TIMEOUT, release_tools.MAX_GATE_TIMEOUT
+        )
+        for name in ("release.yml", "nightly.yml"):
+            gate = verify_workflow_structure.load_workflow(root / name)["jobs"]["gate"]
+            with self.subTest(workflow=name):
+                self.assertGreater(
+                    gate["timeout-minutes"] * 60, release_tools.DEFAULT_GATE_TIMEOUT
+                )
+
+    def test_required_workflows_cancel_only_pull_request_runs(self):
+        root = Path(__file__).resolve().parent.parent / ".github/workflows"
+        for name, prefix in (("ci.yml", "ci"), ("security.yml", "security")):
+            concurrency = verify_workflow_structure.load_workflow(root / name)[
+                "concurrency"
+            ]
+            with self.subTest(workflow=name):
+                self.assertEqual(
+                    concurrency,
+                    {
+                        "group": (
+                            f"{prefix}-${{{{ github.event.pull_request.number"
+                            " || github.sha }}"
+                        ),
+                        "cancel-in-progress": (
+                            "${{ github.event_name == 'pull_request' }}"
+                        ),
+                    },
+                )
 
 
 if __name__ == "__main__":

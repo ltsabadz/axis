@@ -122,7 +122,7 @@ GUI_JOBS = {"build-frontend", "build-macos", "build-linux", "build-windows"}
 # Canonical job digests cover every field and preserve ordered step lists.
 EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6a0829b6d0fca5d53cbc17051cb8e095cec10af735aa5fe7ecfc5b4087ba063a",
-    "gate": "6c2c7b11eefc3f57f2e94c391ad7bbba235c46cc3944ad06fec7a9f245fa41ad",
+    "gate": "e9b48c21189d218a9a4fc22dfc0648b16446fb48035bb60d10ce53039915a7ec",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
     "build": "23ce71f07051b1a631b37d2d088f23ced6c27de0d5e87ce9dae437de30735ab0",
     "package-linux": "33f8038e28b58b653147510eac3f2a284c73c98abef13bbc6d628690278e91c4",
@@ -133,7 +133,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
 }
 EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "396c0c9226914fc2d6d77d0abc0962b816b24fdb585f970ecd485b1d536e8443",
-    "gate": "ccc3041871c557de8f4d4dda8f22e76b93948bd6f2aec6d7d623a4637292fc12",
+    "gate": "89719e97a6971db7d1b882217a045718b6cea99a0998f76777e6204ffd62d040",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
     "build": "5173e93aa245cfcbedae844a9696cf96762e0d7416ab1a4a890705bcd0cb135b",
     "sbom": "10e8e7caa4982974d3bacfc5fb6a0561459f3f6049849089724b18cbacf92680",
@@ -1116,7 +1116,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
     require_job_runtime(
         gate,
         "ubuntu-24.04",
-        25,
+        50,
         "release gate job",
         {"actions": "read", "contents": "read"},
     )
@@ -1357,7 +1357,7 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
     require_job_runtime(
         gate,
         "ubuntu-24.04",
-        25,
+        50,
         "nightly gate job",
         {"actions": "read", "contents": "read"},
     )

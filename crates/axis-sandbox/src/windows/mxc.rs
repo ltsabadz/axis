@@ -266,10 +266,17 @@ impl MxcExecutorChild {
 
 impl MxcWindowsSandbox {
     pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
-        let (wire_config, accepted_weaker) = build_windows_processcontainer_launch(config)
-            .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
-        let executor = MxcWindowsExecutor::resolve()
-            .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
+        let (wire_config, accepted_weaker) = {
+            let _span = axis_core::timing::span("backend.translate_policy");
+            build_windows_processcontainer_launch(config)
+                .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?
+        };
+        let executor = {
+            let _span = axis_core::timing::span("backend.preflight.executor");
+            MxcWindowsExecutor::resolve()
+                .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?
+        };
+        axis_core::timing::meta("executor", executor.path.display());
         // Interactive `axis run` filters tracing to errors, so the user would
         // not see a tracing warning.
         for weaker in &accepted_weaker {
@@ -350,6 +357,7 @@ impl MxcWindowsSandbox {
     }
 
     fn cleanup_after_stop(&mut self) {
+        let _span = axis_core::timing::span("cleanup.after_stop");
         // Closing the Job Object is the final process-tree kill boundary.
         self.job.take();
         self.config_file.take();
@@ -376,7 +384,10 @@ impl SandboxImpl for MxcWindowsSandbox {
                 "Windows MXC backend is already started".into(),
             ));
         }
-        self.create_tmpdir()?;
+        {
+            let _span = axis_core::timing::span("support_files.tmpdir");
+            self.create_tmpdir()?;
+        }
         let result = self.launch();
         if result.is_err() {
             self.cleanup_tmpdir();
@@ -402,6 +413,7 @@ impl SandboxImpl for MxcWindowsSandbox {
                     .ok_or_else(|| SandboxError::SpawnFailed("no Windows MXC child".into()))?
                     .try_wait()?;
                 if let Some(code) = status {
+                    axis_core::timing::mark(axis_core::timing::CHILD_REAPED_MARK);
                     self.child.take();
                     self.exit_code = Some(code);
                     self.cleanup_after_stop();
@@ -445,21 +457,26 @@ impl SandboxImpl for MxcWindowsSandbox {
 
 impl MxcWindowsSandbox {
     fn launch(&mut self) -> Result<u32, SandboxError> {
-        let config = self
-            .executor
-            .write_private_config(&self.wire_config)
-            .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?;
+        let config = {
+            let _span = axis_core::timing::span("support_files.mxc_config");
+            self.executor
+                .write_private_config(&self.wire_config)
+                .map_err(|err| SandboxError::IsolationFailed(err.to_string()))?
+        };
         // The executor itself occupies one process slot in the job.
-        let job = super::job_object::create_limited_kill_on_close_job(
-            if self.max_processes > 0 {
-                self.max_processes + 1
-            } else {
-                0
-            },
-            self.max_memory_mb,
-            self.cpu_rate_percent,
-        )
-        .map_err(|err| SandboxError::IsolationFailed(format!("MXC Job Object: {err}")))?;
+        let job = {
+            let _span = axis_core::timing::span("resource_setup.job_object");
+            super::job_object::create_limited_kill_on_close_job(
+                if self.max_processes > 0 {
+                    self.max_processes + 1
+                } else {
+                    0
+                },
+                self.max_memory_mb,
+                self.cpu_rate_percent,
+            )
+            .map_err(|err| SandboxError::IsolationFailed(format!("MXC Job Object: {err}")))?
+        };
         let mut command = Command::new(&self.executor.path);
         {
             use std::os::windows::process::CommandExt;
@@ -479,19 +496,31 @@ impl MxcWindowsSandbox {
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr));
         }
+        let spawned = {
+            let _span = axis_core::timing::span("spawn.child");
+            command.spawn()
+        };
         let mut child =
-            MxcExecutorChild::Standard(command.spawn().map_err(|err| {
+            MxcExecutorChild::Standard(spawned.map_err(|err| {
                 SandboxError::SpawnFailed(format!("Windows MXC executor: {err}"))
             })?);
         let pid = child.id();
-        if let Err(err) = super::job_object::assign_process_to_job(&job, pid) {
+        let assigned = {
+            let _span = axis_core::timing::span("spawn.job_assign");
+            super::job_object::assign_process_to_job(&job, pid)
+        };
+        if let Err(err) = assigned {
             let _ = child.kill();
             let _ = child.wait();
             return Err(SandboxError::IsolationFailed(format!(
                 "MXC Job Object assignment: {err}"
             )));
         }
-        if let Err(err) = super::job_object::resume_process(pid) {
+        let resumed = {
+            let _span = axis_core::timing::span("spawn.resume");
+            super::job_object::resume_process(pid)
+        };
+        if let Err(err) = resumed {
             let _ = child.kill();
             let _ = child.wait();
             return Err(SandboxError::IsolationFailed(format!(

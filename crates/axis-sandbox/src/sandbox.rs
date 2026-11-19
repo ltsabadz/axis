@@ -194,6 +194,7 @@ pub(crate) fn record_startup_result<T, E>(
     phase: &'static str,
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    let _span = axis_core::timing::span(phase);
     let start = Instant::now();
     let result = f();
     if let Some(trace) = trace {
@@ -244,7 +245,17 @@ impl Sandbox {
         manage_agent_workspace: bool,
         choice: BackendChoice,
     ) -> Result<Self, SandboxError> {
+        let _span = axis_core::timing::span("sandbox.create");
         let backend = choice.backend;
+        axis_core::timing::meta("backend", format_args!("{backend:?}"));
+        axis_core::timing::meta(
+            "provider",
+            format_args!("{:?}", config.policy.runtime.provider),
+        );
+        axis_core::timing::meta(
+            "network_mode",
+            format_args!("{:?}", config.policy.network.mode),
+        );
         let trace = config.startup_trace.clone();
         record_startup_result(&trace, "front_door.policy_validation", || {
             config
@@ -294,6 +305,7 @@ impl Sandbox {
 
     /// Start the sandboxed process.
     pub fn start(&mut self) -> Result<(), SandboxError> {
+        let _span = axis_core::timing::span("sandbox.start");
         let pid = self.inner.start()?;
         self.pid = Some(pid);
         // Take captured stdio handles from the platform impl.
@@ -307,6 +319,7 @@ impl Sandbox {
 
     /// Wait for the sandboxed process to exit. Returns the exit code.
     pub async fn wait(&mut self) -> Result<i32, SandboxError> {
+        let _span = axis_core::timing::span("sandbox.wait");
         let code = self.inner.wait().await?;
         self.status = SandboxStatus::Stopped;
         Ok(code)
@@ -326,6 +339,7 @@ impl Sandbox {
 
     /// Terminate the sandboxed process and clean up resources.
     pub fn destroy(&mut self) -> Result<(), SandboxError> {
+        let _span = axis_core::timing::span("sandbox.destroy");
         self.inner.destroy()?;
         // Restore original directories by removing symlinks.
         crate::workspace::cleanup_agent_symlinks(&self.agent_symlinks);

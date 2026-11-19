@@ -247,6 +247,7 @@ impl ParentDeathGuard {
     }
 
     fn finish(&mut self) {
+        let _span = axis_core::timing::span("cleanup.parent_death_guard");
         self.disarm();
         self.wait_for_monitor();
     }
@@ -578,6 +579,7 @@ impl LinuxSandbox {
         N: FnOnce(&str) -> Result<(), String>,
         H: FnOnce(SandboxId, &str) -> Result<netns::HelperCleanupOutcome, String>,
     {
+        let _span = axis_core::timing::span("cleanup.after_exit");
         let mut cleanup_errors = Vec::new();
         self.stop_connect_supervisor();
         self.finish_parent_death_guard();
@@ -2336,6 +2338,7 @@ impl SandboxImpl for LinuxSandbox {
                     return Err(SandboxError::Io(e));
                 }
             };
+            axis_core::timing::mark(axis_core::timing::CHILD_REAPED_MARK);
             let code = status.code().unwrap_or(-1);
             self.exit_code = Some(code);
             kill_process_group(pid);

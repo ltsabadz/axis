@@ -1035,6 +1035,7 @@ impl MxcLinuxSandbox {
                     cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
                 append_cleanup_failure(err, cleanup_error)
             })?;
+        axis_core::timing::meta("executor", executor.path.display());
         let allowed_proxy_env = allowed_proxy_env(&proxy_strategy);
         if config.backend_preflight == BackendPreflight::DryRun {
             crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_dry_run", || {
@@ -1084,6 +1085,7 @@ impl MxcLinuxSandbox {
     }
 
     fn cleanup_after_stop(&mut self) -> Result<(), SandboxError> {
+        let _span = axis_core::timing::span("cleanup.after_stop");
         self.finish_parent_death_guard();
         self.config_file.take();
         self.seccomp_filter_file.take();
@@ -2171,6 +2173,7 @@ impl SandboxImpl for MxcLinuxSandbox {
                     return Err(SandboxError::Io(err));
                 }
             };
+            axis_core::timing::mark(axis_core::timing::CHILD_REAPED_MARK);
             let code = status.code().unwrap_or(-1);
             self.exit_code = Some(code);
             kill_process_group(pid);

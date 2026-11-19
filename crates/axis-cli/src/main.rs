@@ -164,8 +164,24 @@ enum InferenceAction {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    axis_core::timing::init_from_env("axis");
+    // The same runtime `#[tokio::main]` builds, built here so its start-up
+    // is timed.
+    let runtime = {
+        let _span = axis_core::timing::span("cli.runtime");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+    };
+    let result = runtime.block_on(async_main());
+    axis_core::timing::finish();
+    result
+}
+
+async fn async_main() -> Result<()> {
+    let init_span = axis_core::timing::span("cli.init");
     // Git-style subcommand extension: if the first arg matches a wrapper
     // in ~/.axis/bin/, execute it directly. This lets `axis claude ...`
     // work as `claude ...` through the AXIS sandbox.
@@ -198,6 +214,7 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    drop(init_span);
 
     match cli.command {
         Commands::Uninstall { agents, all } => {
@@ -763,7 +780,14 @@ const AXIS_FAILURE_EXIT_CODE: i32 = 125;
 
 fn exit_with_axis_failure(err: &anyhow::Error) -> ! {
     eprintln!("Error: {err:?}");
-    std::process::exit(AXIS_FAILURE_EXIT_CODE);
+    exit_process(AXIS_FAILURE_EXIT_CODE);
+}
+
+/// `std::process::exit` after writing the timing file, which an exit would
+/// otherwise skip.
+fn exit_process(code: i32) -> ! {
+    axis_core::timing::finish();
+    std::process::exit(code);
 }
 
 /// Runs `command` in a new sandbox and exits with its status. Returns only
@@ -774,10 +798,12 @@ async fn run_command(
     command: &[String],
     is_interactive: bool,
 ) -> Result<()> {
+    let policy_span = axis_core::timing::span("cli.policy");
     let policy_yaml = resolve_policy_yaml(std::path::Path::new(policy))?;
 
     // Validate.
     let parsed = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
+    drop(policy_span);
     if !is_interactive {
         eprintln!("AXIS: sandbox '{}' starting...", parsed.name);
     }
@@ -793,7 +819,11 @@ async fn run_command(
         "env": [],
     });
 
-    match send_ipc(socket, &request).await {
+    let probe = {
+        let _span = axis_core::timing::span("cli.daemon_probe");
+        send_ipc(socket, &request).await
+    };
+    match probe {
         Ok(response) => {
             if response["success"].as_bool() == Some(true) {
                 let id = response["data"]["sandbox_id"].as_str().unwrap_or("?");
@@ -816,6 +846,7 @@ async fn run_command(
             }
         }
         Err(_) => {
+            let config_span = axis_core::timing::span("cli.config");
             // Daemon not running — run sandbox directly (standalone mode).
             let quiet = std::io::IsTerminal::is_terminal(&std::io::stdin());
             if !quiet {
@@ -841,6 +872,7 @@ async fn run_command(
                 connect_attribution.clone(),
             ) {
                 Some(proxy_config) => {
+                    let _span = axis_core::timing::span("cli.proxy");
                     let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
                         .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
                     let addr = proxy
@@ -898,6 +930,7 @@ async fn run_command(
                 backend_preflight: Default::default(),
                 startup_trace: None,
             };
+            drop(config_span);
 
             let mut sandbox =
                 axis_sandbox::Sandbox::create(config).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -917,7 +950,7 @@ async fn run_command(
                 // Claude Code (setRawMode fails).
                 let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
                 sandbox.destroy().ok();
-                std::process::exit(code);
+                exit_process(code);
             } else {
                 // Non-interactive: wait for process or Ctrl+C. destroy()
                 // MUST run after the wait too: wait() only kills the local
@@ -927,7 +960,7 @@ async fn run_command(
                     code = sandbox.wait() => {
                         let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
                         sandbox.destroy().ok();
-                        std::process::exit(code);
+                        exit_process(code);
                     }
                     _ = tokio::signal::ctrl_c() => {
                         sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;

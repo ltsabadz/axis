@@ -34,6 +34,7 @@ impl SandboxImpl for MacosSandbox {
 
         let sandbox_id = self.config.id;
 
+        let profile_span = axis_core::timing::span("support_files.seatbelt_profile");
         // Generate Seatbelt profile from policy.
         let seatbelt_profile =
             profile::generate_profile(&self.config.policy, &self.config.workspace_dir);
@@ -42,6 +43,7 @@ impl SandboxImpl for MacosSandbox {
         let profile_path = self.config.workspace_dir.join(".axis-sandbox.sb");
         std::fs::write(&profile_path, &seatbelt_profile)
             .map_err(|e| SandboxError::IsolationFailed(format!("write profile: {e}")))?;
+        drop(profile_span);
 
         let mut cmd = Command::new("sandbox-exec");
         cmd.arg("-f").arg(&profile_path);
@@ -83,9 +85,11 @@ impl SandboxImpl for MacosSandbox {
             cmd.stderr(std::process::Stdio::from(stderr));
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
+        let spawned = {
+            let _span = axis_core::timing::span("spawn.child");
+            cmd.spawn()
+        };
+        let child = spawned.map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
 
         let pid = child.id();
         self.child = Some(child);
@@ -104,6 +108,7 @@ impl SandboxImpl for MacosSandbox {
                 .as_mut()
                 .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?;
             let status = tokio::task::block_in_place(|| child.wait())?;
+            axis_core::timing::mark(axis_core::timing::CHILD_REAPED_MARK);
             Ok(status.code().unwrap_or(-1))
         })
     }

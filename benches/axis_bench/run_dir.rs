@@ -70,6 +70,18 @@ pub struct Sample {
     pub child_exit_us: Option<u64>,
     /// Merged trace, relative to the run directory.
     pub trace: Option<String>,
+    /// `axis` and every process started under it; recorded on Windows only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<Process>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Process {
+    /// File name of the program without its extension.
+    pub name: String,
+    pub pid: u32,
+    pub start_us: u64,
+    pub exit_us: Option<u64>,
 }
 
 impl Sample {

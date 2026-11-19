@@ -6,10 +6,12 @@
 //! A row is self time on axis's main thread: the time inside a span minus the
 //! spans nested in it, grouped by the span name up to `depth` dot-separated
 //! parts. The time `sandbox.wait` spends waiting is split by the child's
-//! timestamps into before command, command, and after command. Every launch's
-//! rows therefore add up to its total, and the remainder is `untraced`.
+//! timestamps into before command, command, and after command, and where
+//! processes were recorded, the waits before and after the command are split
+//! again by the newest process running. Every launch's rows therefore add up
+//! to its total, and the remainder is `untraced`.
 
-use crate::run_dir::{Manifest, Sample};
+use crate::run_dir::{Manifest, Process, Sample};
 use axis_core::timing::{CATEGORY, CHILD_REAPED_MARK, PROCESS_FINISH_MARK, PROCESS_MAIN_MARK};
 use serde::Serialize;
 use serde_json::Value;
@@ -25,6 +27,8 @@ pub const AXIS_EXIT: &str = "axis exit";
 pub const UNTRACED: &str = "untraced";
 pub const TOTAL: &str = "total";
 const WAIT_SPAN: &str = "sandbox.wait";
+/// Programs that run beside a console program instead of doing its work.
+const BYSTANDERS: &[&str] = &["conhost"];
 
 /// The `axis` events of a trace.
 #[derive(Debug, Default)]
@@ -138,16 +142,19 @@ pub fn breakdown(sample: &Sample, trace: Option<&AxisTrace>, depth: usize) -> La
     match bounds {
         Some((main, finish, trace)) => {
             rows.add(AXIS_START, main.ts.saturating_sub(sample.spawn_unix_us));
-            add_spans(&mut rows, trace, main.tid, child, depth);
+            add_spans(&mut rows, trace, main.tid, child, &sample.processes, depth);
             rows.add(AXIS_EXIT, sample.exit_unix_us.saturating_sub(finish.ts));
             let untraced = sample.total_us.saturating_sub(rows.sum());
             rows.add(UNTRACED, untraced);
         }
         None => {
             if let Some((main, exit)) = child {
-                rows.add(BEFORE_COMMAND, main - sample.spawn_unix_us);
+                let processes = &sample.processes;
+                let before = (sample.spawn_unix_us, main);
+                add_by_process(&mut rows, BEFORE_COMMAND, before, processes, depth);
                 rows.add(COMMAND, exit - main);
-                rows.add(AFTER_COMMAND, sample.exit_unix_us - exit);
+                let after = (exit, sample.exit_unix_us);
+                add_by_process(&mut rows, AFTER_COMMAND, after, processes, depth);
             }
         }
     }
@@ -185,11 +192,57 @@ fn group(name: &str, depth: usize) -> String {
         .join(".")
 }
 
+/// Adds `[from, to)` to `row` or, where processes were recorded, to
+/// `row.<program>` for the newest process running at each moment.
+fn add_by_process(
+    rows: &mut Rows,
+    row: &str,
+    (from, to): (u64, u64),
+    processes: &[Process],
+    depth: usize,
+) {
+    if processes.is_empty() {
+        rows.add(row, to.saturating_sub(from));
+        return;
+    }
+    let mut cuts: Vec<u64> = processes
+        .iter()
+        .flat_map(|process| [Some(process.start_us), process.exit_us])
+        .flatten()
+        .filter(|&at| from < at && at < to)
+        .collect();
+    cuts.sort_unstable();
+    let mut start = from;
+    for end in cuts.into_iter().chain([to]) {
+        if end > start {
+            let name = match newest_running(processes, start) {
+                Some(process) => format!("{row}.{}", process.name.replace('.', "_")),
+                None => row.to_string(),
+            };
+            rows.add(&group(&name, depth), end - start);
+        }
+        start = end;
+    }
+}
+
+fn newest_running(processes: &[Process], at: u64) -> Option<&Process> {
+    processes
+        .iter()
+        .filter(|process| process.start_us <= at && process.exit_us.is_none_or(|exit| at < exit))
+        .filter(|process| {
+            !BYSTANDERS
+                .iter()
+                .any(|name| process.name.eq_ignore_ascii_case(name))
+        })
+        .max_by_key(|process| process.start_us)
+}
+
 struct SpanTree<'a> {
     spans: Vec<&'a TraceSpan>,
     children: Vec<Vec<usize>>,
     child: Option<(u64, u64)>,
     reaped: Option<u64>,
+    processes: &'a [Process],
     depth: usize,
     wait_split: bool,
 }
@@ -199,6 +252,7 @@ fn add_spans(
     trace: &AxisTrace,
     main_tid: u64,
     child: Option<(u64, u64)>,
+    processes: &[Process],
     depth: usize,
 ) {
     let mut spans: Vec<&TraceSpan> = trace
@@ -225,6 +279,7 @@ fn add_spans(
         children,
         child,
         reaped: trace.mark(CHILD_REAPED_MARK).map(|mark| mark.ts),
+        processes,
         depth,
         wait_split: false,
     };
@@ -250,11 +305,6 @@ impl SpanTree<'_> {
         }
         if span.name == WAIT_SPAN && !self.wait_split {
             self.wait_split = true;
-            if self.child.is_some() {
-                for row in [BEFORE_COMMAND, COMMAND, AFTER_COMMAND] {
-                    rows.add(row, 0);
-                }
-            }
             for gap in gaps {
                 self.split_wait(gap, rows);
             }
@@ -281,7 +331,16 @@ impl SpanTree<'_> {
         let mut start = from;
         for end in cuts.into_iter().chain([to]) {
             if end > start {
-                rows.add(&self.wait_row(start), end - start);
+                let row = self.wait_row(start);
+                if row == AFTER_COMMAND {
+                    // Lists a command that took no time, between the waits around it.
+                    rows.add(COMMAND, 0);
+                }
+                if [BEFORE_COMMAND, AFTER_COMMAND, UNTIL_COMMAND_EXIT].contains(&row.as_str()) {
+                    add_by_process(rows, &row, (start, end), self.processes, self.depth);
+                } else {
+                    rows.add(&row, end - start);
+                }
             }
             start = end;
         }
@@ -556,6 +615,26 @@ mod tests {
             child_main_us: child.map(|c| c.0),
             child_exit_us: child.map(|c| c.1),
             trace: None,
+            processes: Vec::new(),
+        }
+    }
+
+    fn with_processes(child: (u64, u64)) -> Sample {
+        let process = |name: &str, pid, start_us, exit_us| Process {
+            name: name.into(),
+            pid,
+            start_us,
+            exit_us: Some(exit_us),
+        };
+        Sample {
+            processes: vec![
+                process("axis", 1, 1_000, 2_000),
+                process("wxc-exec", 2, 1_250, 1_750),
+                process("conhost", 3, 1_260, 1_750),
+                process("bfscfg", 4, 1_320, 1_350),
+                process("axis-bench-child", 5, 1_380, 1_610),
+            ],
+            ..sample(Some(child))
         }
     }
 
@@ -650,6 +729,34 @@ mod tests {
         assert_eq!(row(&launch, COMMAND), 100);
         assert_eq!(row(&launch, AFTER_COMMAND), 600);
         assert!(breakdown(&sample(None), None, 1).rows.is_empty());
+    }
+
+    #[test]
+    fn waits_are_split_by_the_newest_running_process() {
+        let sample = with_processes((1_400, 1_600));
+        let launch = breakdown(&sample, Some(&trace()), 2);
+        assert_eq!(row(&launch, "before command.wxc-exec"), 20 + 30);
+        assert_eq!(row(&launch, "before command.bfscfg"), 30);
+        assert_eq!(row(&launch, "before command.axis-bench-child"), 20);
+        assert_eq!(row(&launch, COMMAND), 200);
+        assert_eq!(row(&launch, "after command.axis-bench-child"), 10);
+        assert_eq!(row(&launch, "after command.wxc-exec"), 140);
+        assert_eq!(row(&launch, "after command.axis"), 50);
+        assert!(launch.value("before command.conhost").is_none());
+        let position = |name: &str| launch.rows.iter().position(|(row, _)| row == name).unwrap();
+        assert!(position("before command.axis-bench-child") < position(COMMAND));
+        assert!(position(COMMAND) < position("after command.axis-bench-child"));
+        let sum: u64 = launch.rows.iter().map(|(_, us)| us).sum();
+        assert_eq!(sum, launch.total_us);
+
+        let launch = breakdown(&sample, Some(&trace()), 1);
+        assert_eq!(row(&launch, BEFORE_COMMAND), 100);
+        assert_eq!(row(&launch, AFTER_COMMAND), 200);
+
+        let launch = breakdown(&sample, None, 2);
+        assert_eq!(row(&launch, "before command.axis"), 250);
+        assert_eq!(row(&launch, "before command.wxc-exec"), 70 + 30);
+        assert_eq!(row(&launch, "after command.axis"), 250);
     }
 
     #[test]

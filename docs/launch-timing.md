@@ -125,6 +125,15 @@ Rows that need a word:
 | `untraced` | main-thread time outside every step; above 5% of the total, a step is missing a span |
 | `total` | spawn to exit, measured by `axis-bench` |
 
+On Windows, `axis-bench` also records every process started under `axis`,
+such as `wxc-exec`, helpers like `bfscfg`, and the command, with when each
+started and exited. It joins a job object without limits, whose completion
+port reports them. With `--depth 2` or more, the waits before and after the
+command are split by process: each moment goes to the newest process still
+running, ignoring `conhost`. So `before command.bfscfg` is time while `bfscfg`
+ran, and `after command.axis` is time when only `axis` was left, for example
+polling for the exit. Other platforms record no processes.
+
 `median` and `p90` (nearest rank) are per build. The difference column is the
 median of the per-round differences (`b` minus `a` in the same round), with a
 distribution-free 95% interval for it from the sign test. A `*` marks an
@@ -155,9 +164,9 @@ Every run is saved under `--output` (default `bench-runs`) as
 | File | Contents |
 | --- | --- |
 | `manifest.json` | settings, seed, host, CPU load during the rounds, and each build's files with sizes and SHA-256 |
-| `samples.jsonl` | one line per measured launch: build, round, exit code, error, timestamps |
+| `samples.jsonl` | one line per measured launch: build, round, exit code, error, timestamps, and on Windows its processes |
 | `summary.json` | the table at depth 1 |
-| `traces/<tag>/<round>.json` | the launch as `axis-bench` saw it, the command as it reported itself, and every step AXIS recorded |
+| `traces/<tag>/<round>.json` | the launch as `axis-bench` saw it, the command as it reported itself, every step AXIS recorded, and on Windows its processes |
 
 Open a trace in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to
 see one launch on a timeline, including steps on other threads.

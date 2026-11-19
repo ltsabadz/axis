@@ -8,6 +8,7 @@ mod analysis;
 mod compare;
 mod host;
 mod launch;
+mod processes;
 mod report;
 mod run_dir;
 mod show;

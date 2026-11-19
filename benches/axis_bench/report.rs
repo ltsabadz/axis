@@ -354,6 +354,20 @@ fn legend(table: &Table, paired: bool) -> String {
             let _ = writeln!(out, "  {key:<20} {description}");
         }
     }
+    let waits = [
+        analysis::BEFORE_COMMAND,
+        analysis::AFTER_COMMAND,
+        analysis::UNTIL_COMMAND_EXIT,
+    ];
+    if table.rows.iter().any(|row| {
+        row.split_once('.')
+            .is_some_and(|(wait, _)| waits.contains(&wait))
+    }) {
+        out.push_str(
+            "Rows like before command.<program> give each moment of the wait to the newest\n\
+             process still running, conhost aside; .axis means only axis itself was running.\n",
+        );
+    }
     if table.columns.len() > 1 {
         out.push_str(if paired {
             "x - base: median of the per-round differences and its 95% interval;\n\

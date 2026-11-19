@@ -3,7 +3,8 @@
 
 //! `axis-bench launch`: times `axis run` for one or more builds.
 
-use crate::run_dir::{self, BuildInfo, Manifest, Sample};
+use crate::processes::Watcher;
+use crate::run_dir::{self, BuildInfo, Manifest, Process, Sample};
 use crate::stage::{Stage, StagedBuild};
 use crate::{Result, analysis, host, report};
 use axis_core::timing::TIMING_FILE_ENV;
@@ -15,6 +16,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const CHILD_LINE: &str = "AXIS_BENCH_CHILD ";
+/// Trace process that holds one thread per recorded process. It is above
+/// Linux's largest pid and not a multiple of 4 like Windows pids, so it
+/// cannot clash with a real process.
+const PROCESSES_TRACK: u32 = 4_194_305;
 
 #[derive(clap::Args)]
 pub struct LaunchArgs {
@@ -135,6 +140,7 @@ pub fn run(args: LaunchArgs) -> Result<()> {
             .collect(),
     };
 
+    let watcher = Watcher::start();
     let launcher = Launcher {
         stage: &stage,
         run_dir: &dir,
@@ -143,6 +149,7 @@ pub fn run(args: LaunchArgs) -> Result<()> {
         command: &args.command,
         daemon_probe: args.daemon_probe,
         timeout: Duration::from_secs(args.timeout),
+        watcher: watcher.as_ref(),
     };
     let pause = Duration::from_millis(args.pause_ms);
     for (build, &timing) in staged.iter().zip(&timing) {
@@ -313,6 +320,7 @@ struct Launcher<'a> {
     command: &'a [String],
     daemon_probe: bool,
     timeout: Duration,
+    watcher: Option<&'a Watcher>,
 }
 
 impl Launcher<'_> {
@@ -356,6 +364,9 @@ impl Launcher<'_> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        if let Some(watcher) = self.watcher {
+            watcher.clear();
+        }
         let spawn_unix_us = host::unix_micros();
         let started = Instant::now();
         let mut process = command
@@ -370,6 +381,14 @@ impl Launcher<'_> {
         let _ = stop_watchdog.send(());
         let timed_out = watchdog.join().unwrap_or(false);
         let (stdout, stderr) = (collect(stdout), collect(stderr));
+        let processes = self.watcher.map_or_else(Vec::new, |watcher| {
+            with_axis(
+                watcher.take(process.id()),
+                process.id(),
+                spawn_unix_us,
+                exit_unix_us,
+            )
+        });
         let _ = std::fs::remove_dir_all(&workspace);
 
         let child_line = parse_child_line(&stdout);
@@ -396,6 +415,7 @@ impl Launcher<'_> {
             child_main_us: child_line.map(|line| line.0),
             child_exit_us: child_line.map(|line| line.1),
             trace: None,
+            processes,
         };
         if let Some(raw) = &raw_trace {
             let child_pid = child_line.and_then(|line| line.2);
@@ -415,8 +435,9 @@ impl Launcher<'_> {
         child_pid: Option<u32>,
     ) -> Option<String> {
         let process = |pid: u32, name: &str| json!({"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": name}});
-        let span = |pid: u32, name: &str, ts: u64, dur: u64| {
-            json!({"ph": "X", "name": name, "cat": "axis-bench", "pid": pid, "tid": 1, "ts": ts,
+        let thread = |pid: u32, tid: u32, name: &str| json!({"ph": "M", "name": "thread_name", "pid": pid, "tid": tid, "args": {"name": name}});
+        let span = |pid: u32, tid: u32, name: &str, ts: u64, dur: u64| {
+            json!({"ph": "X", "name": name, "cat": "axis-bench", "pid": pid, "tid": tid, "ts": ts,
                    "dur": dur})
         };
         let mut trace: Value = serde_json::from_slice(&std::fs::read(raw).ok()?).ok()?;
@@ -424,11 +445,21 @@ impl Launcher<'_> {
         let tool = std::process::id();
         let launch_us = sample.exit_unix_us.saturating_sub(sample.spawn_unix_us);
         events.push(process(tool, "axis-bench"));
-        events.push(span(tool, "launch", sample.spawn_unix_us, launch_us));
+        events.push(span(tool, 1, "launch", sample.spawn_unix_us, launch_us));
         if let Some((main, exit)) = sample.child_marks() {
             let pid = child_pid.unwrap_or(0);
             events.push(process(pid, "command"));
-            events.push(span(pid, "command", main, exit - main));
+            events.push(span(pid, 1, "command", main, exit - main));
+        }
+        if !sample.processes.is_empty() {
+            events.push(process(PROCESSES_TRACK, "processes"));
+        }
+        for started in &sample.processes {
+            let (pid, tid) = (PROCESSES_TRACK, started.pid);
+            let end = started.exit_us.unwrap_or(sample.exit_unix_us);
+            let dur = end.saturating_sub(started.start_us);
+            events.push(thread(pid, tid, &format!("{} {tid}", started.name)));
+            events.push(span(pid, tid, &started.name, started.start_us, dur));
         }
         let axis = trace["otherData"].take();
         trace["otherData"] = json!({
@@ -442,6 +473,26 @@ impl Launcher<'_> {
         .ok()?;
         Some(relative)
     }
+}
+
+/// The watcher's processes, with `axis` itself timed as axis-bench saw it.
+fn with_axis(mut processes: Vec<Process>, pid: u32, start_us: u64, exit_us: u64) -> Vec<Process> {
+    match processes.iter_mut().find(|process| process.pid == pid) {
+        Some(axis) => {
+            axis.start_us = start_us;
+            axis.exit_us = Some(exit_us);
+        }
+        None => processes.insert(
+            0,
+            Process {
+                name: "axis".into(),
+                pid,
+                start_us,
+                exit_us: Some(exit_us),
+            },
+        ),
+    }
+    processes
 }
 
 fn read_in_background<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {

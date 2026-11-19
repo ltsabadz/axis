@@ -28,6 +28,14 @@ path = "mxc_isolation_matrix.rs"
 name = "runtime-metrics"
 path = "runtime_metrics.rs"
 
+[[bin]]
+name = "axis-bench"
+path = "axis_bench/main.rs"
+
+[[bin]]
+name = "axis-bench-child"
+path = "axis_bench_child.rs"
+
 [dependencies]
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }
@@ -36,3 +44,8 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+clap = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }

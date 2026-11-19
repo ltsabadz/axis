@@ -106,10 +106,13 @@ dependencies = [
  "axis-core",
  "axis-proxy",
  "axis-sandbox",
+ "clap",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "windows",
 ]
 
 [[package]]

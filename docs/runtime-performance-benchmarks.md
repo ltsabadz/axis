@@ -5,6 +5,9 @@ The runtime benchmark suite separates policy evaluation, proxy request timing,
 backend launch work, and interactive terminal cost so numbers can be compared
 only when they measure the same surface.
 
+To time whole `axis run` launches of real builds and see where each launch
+spends its time, use `axis-bench launch` ([launch-timing.md](launch-timing.md)).
+
 Run the profile benchmark with:
 
 ```bash

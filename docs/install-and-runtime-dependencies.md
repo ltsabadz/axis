@@ -22,6 +22,12 @@ Privileged helpers, file capabilities, firewall setup, and OS feature enablement
 are optional setup choices. They must be behind explicit install flags,
 administrator-controlled package steps, or disposable CI/e2e scripts.
 
+The Linux curl installer may install the distribution packages that provide
+the default backend's host tools (`bubblewrap`, `slirp4netns`, `util-linux`,
+and `iptables`), but only after the user confirms at a terminal, and it never
+configures them. Without a terminal it prints the command and installs
+nothing.
+
 ## Runtime Dependency Matrix
 
 | Runtime path | Runtime dependencies | Privilege boundary |

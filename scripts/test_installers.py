@@ -8,7 +8,9 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -18,6 +20,22 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+HOST_TOOLS = (
+    "bwrap",
+    "slirp4netns",
+    "unshare",
+    "nsenter",
+    "iptables",
+    "ip6tables",
+    "iptables-restore",
+    "ip6tables-restore",
+)
+HOST_PACKAGES = ["bubblewrap", "slirp4netns", "util-linux", "iptables"]
+
+linux_only = unittest.skipUnless(
+    sys.platform.startswith("linux"), "host packages are offered only on Linux"
+)
 
 
 FAKE_GH = r"""#!/usr/bin/env python3
@@ -53,6 +71,24 @@ source = root / ("checksum" if url.endswith(".sha256") else "archive")
 shutil.copyfile(source, destination)
 """
 
+FAKE_SUDO = r"""#!/bin/sh
+exec "$@"
+"""
+
+FAKE_APT_GET = r"""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["INSTALLER_FIXTURE_ROOT"])
+entry = {
+    "args": sys.argv[1:],
+    "stdin_is_null": os.path.samestat(os.fstat(0), os.stat("/dev/null")),
+}
+(root / "apt-get.log").open("a", encoding="utf-8").write(json.dumps(entry) + "\n")
+"""
+
 
 class UnixInstallerTests(unittest.TestCase):
     def setUp(self):
@@ -60,9 +96,20 @@ class UnixInstallerTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name, content in (("gh", FAKE_GH), ("curl", FAKE_CURL)):
+        for name, content in (
+            ("gh", FAKE_GH),
+            ("curl", FAKE_CURL),
+            ("sudo", FAKE_SUDO),
+            ("apt-get", FAKE_APT_GET),
+        ):
             path = self.bin / name
             path.write_text(content, encoding="utf-8")
+            path.chmod(0o755)
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        for name in HOST_TOOLS:
+            path = self.tools / name
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             path.chmod(0o755)
         archive = self.root / "archive"
         with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as output:
@@ -80,10 +127,57 @@ class UnixInstallerTests(unittest.TestCase):
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "HOME": str(self.root / "home"),
             "INSTALLER_FIXTURE_ROOT": str(self.root),
+            "AXIS_INSTALL_HOST_TOOL_DIRS": str(self.tools),
         }
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def run_installer_on_terminal(self, answer: str) -> str:
+        import pty
+
+        pid, terminal = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(
+                    "/bin/sh",
+                    ["sh", str(ROOT / "install.sh"), "--prefix", str(self.root / "installed")],
+                    self.environment,
+                )
+            finally:
+                os._exit(127)
+        output = b""
+        answered = False
+        deadline = time.monotonic() + 20
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([terminal], [], [], 0.1)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(terminal, 4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                output += chunk
+                if not answered and b"[Y/n]" in output:
+                    os.write(terminal, answer.encode("ascii") + b"\n")
+                    answered = True
+            else:
+                os.kill(pid, signal.SIGKILL)
+        finally:
+            os.close(terminal)
+            _, status = os.waitpid(pid, 0)
+        text = output.decode(errors="replace")
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, text)
+        return text
+
+    def apt_get_log(self) -> list[dict]:
+        path = self.root / "apt-get.log"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
 
     def run_installer(self, **environment: str) -> subprocess.CompletedProcess[str]:
         install = self.root / "installed"
@@ -134,6 +228,44 @@ class UnixInstallerTests(unittest.TestCase):
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exceeds size limit", result.stdout)
+
+    @linux_only
+    def test_present_host_tools_offer_no_packages(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("Missing host tools", result.stdout)
+        self.assertEqual(self.apt_get_log(), [])
+
+    @linux_only
+    def test_missing_host_tools_without_terminal_print_the_command(self):
+        (self.tools / "slirp4netns").unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue((self.root / "installed/axis").is_file())
+        self.assertIn("Missing host tools: slirp4netns\n", result.stdout)
+        self.assertIn(
+            f"To install them, run: {'' if os.geteuid() == 0 else 'sudo '}apt-get update",
+            result.stdout,
+        )
+        self.assertEqual(self.apt_get_log(), [])
+
+    @linux_only
+    def test_terminal_prompt_installs_host_packages_by_default(self):
+        (self.tools / "slirp4netns").unlink()
+        self.run_installer_on_terminal("")
+        log = self.apt_get_log()
+        self.assertEqual(
+            [entry["args"] for entry in log],
+            [["update"], ["install", "-y", *HOST_PACKAGES]],
+        )
+        self.assertTrue(all(entry["stdin_is_null"] for entry in log))
+
+    @linux_only
+    def test_terminal_prompt_declined_installs_nothing(self):
+        (self.tools / "slirp4netns").unlink()
+        output = self.run_installer_on_terminal("n")
+        self.assertIn("To install them, run:", output)
+        self.assertEqual(self.apt_get_log(), [])
 
     def test_windows_installer_contains_equivalent_enforcement(self):
         source = (ROOT / "install.ps1").read_text(encoding="utf-8")

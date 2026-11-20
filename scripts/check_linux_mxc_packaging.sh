@@ -382,6 +382,10 @@ cp "$REPO_ROOT/LICENSE" "$PACKAGE_ROOT/usr/share/doc/axis/LICENSE"
 
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];'
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'dir.join(AXIS_SECCOMP_LAUNCHER_NAME)'
+# The installer checks for MXC's host tools where AXIS looks for them.
+assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'pub const MXC_EXECUTOR_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";'
+# shellcheck disable=SC2016 # Match the literal shell parameter expansion.
+assert_contains "$REPO_ROOT/install.sh" 'HOST_TOOL_DIRS="${AXIS_INSTALL_HOST_TOOL_DIRS:-/usr/sbin:/usr/bin:/sbin:/bin}"'
 
 assert_contains "$REPO_ROOT/rust-toolchain.toml" 'channel = "1.95.0"'
 assert_contains "$REPO_ROOT/README.md" "docs/setup-and-install.md"

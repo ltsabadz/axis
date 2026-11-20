@@ -115,7 +115,9 @@ the host network; an explicit `provider: mxc` needs them for strict proxy mode
 too. Strict proxy
 and binary-restricted policies use the native backend under `auto` (see
 [Linux](#linux-mxc-process--native-controls) below).
-Those are host runtime prerequisites, not AXIS privileged install steps. If
+Those are host runtime prerequisites, not AXIS privileged install steps. The
+Linux curl installer checks for them and, when any are missing, asks before
+installing the distribution packages with sudo. If
 `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1`, the default
 on Ubuntu 23.10 and later, AppArmor restricts unprivileged user namespaces and
 sandbox launches can fail unless an AppArmor profile permits them. AXIS CI runs

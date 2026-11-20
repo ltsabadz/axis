@@ -32,6 +32,12 @@ enable VM features, or modify firewall rules.
 Windows archives include the pinned MXC `wxc-exec.exe` used by the default
 ProcessContainer path.
 
+On Linux the installer then checks for the host tools listed below. When any
+are missing, it asks at the terminal whether to install `bubblewrap`,
+`slirp4netns`, `util-linux`, and `iptables` with apt, dnf, zypper, or pacman,
+using sudo unless it runs as root. Without a terminal, or when the answer is
+no, it only prints the command.
+
 Verify the basic process sandbox:
 
 ```bash
@@ -163,7 +169,8 @@ sudo apt-get update
 sudo apt-get install -y build-essential curl git python3 bubblewrap
 
 # MXC Bubblewrap allow and proxy network modes (recommended by the AXIS
-# packages, installed automatically unless recommended packages are disabled)
+# packages, installed automatically unless recommended packages are disabled,
+# and offered by install.sh)
 sudo apt-get install -y slirp4netns iptables
 
 # Optional LXC container backend

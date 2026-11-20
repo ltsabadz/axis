@@ -34,6 +34,9 @@ MAX_METADATA_DOWNLOAD=$((1024 * 1024))
 INSTALL_NETNS_HELPER=0
 ENABLE_CAP_NET_ADMIN=0
 HELPER_INSTALL_PATH="/usr/libexec/axis/axis-netns-helper"
+# Must match MXC_EXECUTOR_PATH in crates/axis-sandbox/src/linux/mxc.rs: AXIS
+# looks for the host tools only there.
+HOST_TOOL_DIRS="${AXIS_INSTALL_HOST_TOOL_DIRS:-/usr/sbin:/usr/bin:/sbin:/bin}"
 
 # Parse args.
 while [ $# -gt 0 ]; do
@@ -270,6 +273,62 @@ enable_cap_net_admin() {
     echo "  CAP_NET_ADMIN: ${INSTALL_DIR}/axisd"
 }
 
+# curl | sh feeds this script on stdin, so ask on the terminal and keep the
+# package manager off stdin. Without a terminal, only print the command.
+offer_host_packages() {
+    missing=""
+    for tool in bwrap slirp4netns unshare nsenter iptables ip6tables iptables-restore ip6tables-restore; do
+        found=0
+        for dir in $(echo "$HOST_TOOL_DIRS" | tr ':' ' '); do
+            if [ -f "$dir/$tool" ] && [ -x "$dir/$tool" ]; then
+                found=1
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            missing="$missing $tool"
+        fi
+    done
+    if [ -z "$missing" ]; then
+        return
+    fi
+    echo "Missing host tools:$missing"
+
+    packages="bubblewrap slirp4netns util-linux iptables"
+    sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+        sudo="sudo "
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        install_command="${sudo}apt-get update && ${sudo}apt-get install -y $packages"
+    elif command -v dnf >/dev/null 2>&1; then
+        install_command="${sudo}dnf install -y $packages"
+    elif command -v zypper >/dev/null 2>&1; then
+        install_command="${sudo}zypper --non-interactive install $packages"
+    elif command -v pacman >/dev/null 2>&1; then
+        install_command="${sudo}pacman -S --needed --noconfirm $packages"
+    else
+        echo "Install $packages with your package manager."
+        echo ""
+        return
+    fi
+
+    answer="n"
+    if [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
+        printf 'Install them now with: %s [Y/n] ' "$install_command" >/dev/tty
+        read -r answer </dev/tty || answer="n"
+    fi
+    case "$answer" in
+        ""|[Yy]*)
+            if sh -c "$install_command" </dev/null; then
+                echo ""
+                return
+            fi
+            ;;
+    esac
+    echo "To install them, run: $install_command"
+    echo ""
+}
+
 # Get the download URL for the latest release.
 get_download_url() {
     if [ -n "$LOCAL_ARCHIVE" ]; then
@@ -480,6 +539,10 @@ install() {
     fi
 
     echo ""
+
+    if [ "$OS" = "linux" ]; then
+        offer_host_packages
+    fi
 
     # Check PATH.
     case ":$PATH:" in
